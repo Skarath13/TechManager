@@ -31,7 +31,7 @@ import {
   DialogContent,
   DialogActions,
 } from '@mui/material';
-import { supabase } from '../services/supabase';
+import { supabase } from '../lib/supabaseClient';
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -42,6 +42,7 @@ import {
   Legend,
 } from 'chart.js';
 import { Bar } from 'react-chartjs-2';
+import { useAuth, Location } from '../contexts/AuthContext';
 
 ChartJS.register(
   CategoryScale,
@@ -62,6 +63,8 @@ interface Transaction {
   tip: number;
   location: string;
   tip_method: string | null;
+  created_at: string;
+  isEditing?: boolean;
 }
 
 type SortField = 'date' | 'technician_name' | 'total' | 'tip' | 'payment_method' | 'location';
@@ -70,9 +73,10 @@ type SortDirection = 'asc' | 'desc';
 interface Technician {
   id: number;
   name: string;
+  email: string;
+  active: boolean;
   location: string;
   commission_rate: number;
-  active: boolean;
 }
 
 interface Submission {
@@ -144,22 +148,27 @@ const formatDisplayDate = (date: Date): string => {
 
 const formatDateTime = (dateStr: string) => {
   const date = new Date(dateStr);
-  return date.toLocaleString('en-US', {
+  const formattedDate = date.toLocaleString('en-US', {
     month: 'numeric',
     day: 'numeric',
     year: '2-digit',
+  });
+  const formattedTime = date.toLocaleString('en-US', {
     hour: 'numeric',
     minute: '2-digit',
     hour12: true
   });
+  return `${formattedDate} | ${formattedTime}`;
 };
 
-const LOCATIONS = [
-  "Irvine Team",
-  "Tustin Team",
-  "Santa Ana Team",
-  "Costa Mesa Team"
-];
+const LOCATIONS = ['irvine', 'tustin', 'santa_ana', 'costa_mesa'] as const;
+
+const LOCATION_DISPLAY_NAMES: Record<string, string> = {
+  'irvine': 'Irvine',
+  'tustin': 'Tustin',
+  'santa_ana': 'Santa Ana',
+  'costa_mesa': 'Costa Mesa'
+};
 
 interface EditableTransaction extends Transaction {
   isEditing: boolean;
@@ -190,6 +199,7 @@ const createSubmissionData = (tech: TechnicianSummary, isCashOut: boolean, isChe
 });
 
 export const TransactionManager: React.FC = () => {
+  const { hasLocationAccess } = useAuth();
   const [transactions, setTransactions] = useState<EditableTransaction[]>([]);
   const [techSummaries, setTechSummaries] = useState<TechnicianSummary[]>([]);
   const [technicians, setTechnicians] = useState<Technician[]>([]);
@@ -209,23 +219,10 @@ export const TransactionManager: React.FC = () => {
   const [isHistoricalView, setIsHistoricalView] = useState(false);
   const [isCalendarOpen, setIsCalendarOpen] = useState(false);
 
-  useEffect(() => {
-    if (isHistoricalView) return;
-
-    const checkDayChange = () => {
-      const newDay = formatDate(new Date());
-      if (newDay !== currentDay) {
-        setCurrentDay(newDay);
-        fetchData(new Date());
-        showToast('New day started - refreshing data', 'info');
-      }
-    };
-
-    const interval = setInterval(checkDayChange, 60000);
-    checkDayChange();
-
-    return () => clearInterval(interval);
-  }, [currentDay, isHistoricalView]);
+  // Filter locations based on user access
+  const accessibleLocations = LOCATIONS.filter(location => 
+    hasLocationAccess(location as Location)
+  );
 
   const calculateTechnicianSummaries = useCallback(async (
     transactions: Transaction[], 
@@ -237,12 +234,8 @@ export const TransactionManager: React.FC = () => {
 
     for (const tech of techs) {
       const techTransactions = transactions.filter(t => {
-        if (t.technician_id && tech.id) {
-          return t.technician_id === tech.id;
-        }
-        const techName = tech.name?.toLowerCase();
-        const transName = t.technician_name?.toLowerCase();
-        return techName === transName;
+        return tech.name && t.technician_name && 
+               tech.name.toLowerCase() === t.technician_name.toLowerCase();
       });
       
       const yesterdaySubmission = yesterdaySubmissions.find(s => s.technician_id === tech.id);
@@ -304,64 +297,83 @@ export const TransactionManager: React.FC = () => {
     return summaries;
   }, []);
 
-  const fetchData = useCallback(async (date: Date) => {
+  const fetchData = useCallback(async () => {
+    setLoading(true);
     try {
-      setLoading(true);
-      
-      const targetDate = formatDate(date);
-      const previousDate = formatDate(new Date(date.getTime() - 86400000));
+      const targetDate = formatDate(selectedDate);
+      const previousDate = formatDate(new Date(selectedDate.getTime() - 24 * 60 * 60 * 1000));
 
-      const [techniciansResponse, transactionsResponse, todaySubmissionsResponse, yesterdaySubmissionsResponse] = await Promise.all([
-        supabase.from('technicians').select('*'),
-        supabase
-          .from('orders')
-          .select('*')
-          .gte('date', `${targetDate}T00:00:00-07:00`)
-          .lt('date', `${targetDate}T23:59:59-07:00`)
-          .order('date', { ascending: false }),
-        supabase.from('submissions').select('*').eq('date', targetDate),
-        supabase.from('submissions').select('*').eq('date', previousDate)
+      // Use supabase client for fetching data
+      const techniciansPromise = supabase.from('technicians').select('*');
+      const ordersPromise = supabase.from('orders').select('*').order('date', { ascending: false });
+      const todaySubmissionsPromise = supabase.from('submissions').select('*').eq('date', targetDate);
+      const yesterdaySubmissionsPromise = supabase.from('submissions').select('*').eq('date', previousDate);
+
+      const [
+        { data: techniciansData, error: techniciansError },
+        { data: transactionsData, error: transactionsError },
+        { data: todaySubmissionsData, error: todaySubmissionsError },
+        { data: yesterdaySubmissionsData, error: yesterdaySubmissionsError },
+      ] = await Promise.all([
+        techniciansPromise,
+        ordersPromise,
+        todaySubmissionsPromise,
+        yesterdaySubmissionsPromise,
       ]);
 
-      if (techniciansResponse.error) throw techniciansResponse.error;
-      if (transactionsResponse.error) throw transactionsResponse.error;
-      if (todaySubmissionsResponse.error) throw todaySubmissionsResponse.error;
-      if (yesterdaySubmissionsResponse.error) throw yesterdaySubmissionsResponse.error;
+      // Handle errors
+      if (techniciansError) throw new Error(`Failed to fetch technicians: ${techniciansError.message}`);
+      if (transactionsError) throw new Error(`Failed to fetch orders: ${transactionsError.message}`);
+      if (todaySubmissionsError) throw new Error(`Failed to fetch today's submissions: ${todaySubmissionsError.message}`);
+      if (yesterdaySubmissionsError) throw new Error(`Failed to fetch yesterday's submissions: ${yesterdaySubmissionsError.message}`);
 
-      const activeTechnicians = (techniciansResponse.data || []).filter(tech => tech.active);
+      setTechnicians(techniciansData || []);
+      setTransactions((transactionsData || []).map(tx => ({ ...tx, isEditing: false })));
       
-      const transactionsWithEdit = (transactionsResponse.data || []).map(tx => ({
-        ...tx,
-        isEditing: false,
-        total: tx.total || 0,
-        tip: tx.tip || 0,
-        technician_name: tx.technician_name || 'Unknown',
-        location: tx.location || 'Unknown',
-        payment_method: tx.payment_method || 'cash',
-        tip_method: tx.tip_method || null,
-        date: tx.date || targetDate
-      }));
-
-      setTransactions(transactionsWithEdit);
-
+      // Recalculate summaries whenever data is fetched
       const summaries = await calculateTechnicianSummaries(
-        transactionsWithEdit, 
-        activeTechnicians,
-        todaySubmissionsResponse.data || [],
-        yesterdaySubmissionsResponse.data || []
+        transactionsData || [],
+        techniciansData || [],
+        todaySubmissionsData || [],
+        yesterdaySubmissionsData || []
       );
-      
       setTechSummaries(summaries);
-      setTechnicians(activeTechnicians);
-      setLoading(false);
+      
+      // No need to show toast on every fetch, only on user action?
+      // showToast('Data loaded successfully', 'success');
+
     } catch (error) {
+      console.error("Error fetching data:", error);
+      showToast(error instanceof Error ? error.message : 'Failed to fetch data', 'error');
+      // Clear state on error
+      setTechnicians([]);
+      setTransactions([]);
+      setTechSummaries([]);
+    } finally {
       setLoading(false);
-      showToast('Error fetching data: ' + (error instanceof Error ? error.message : 'Unknown error'), 'error');
     }
-  }, [calculateTechnicianSummaries]);
+  }, [selectedDate, calculateTechnicianSummaries]);
 
   useEffect(() => {
-    fetchData(new Date());
+    if (isHistoricalView) return;
+
+    const checkDayChange = () => {
+      const newDay = formatDate(new Date());
+      if (newDay !== currentDay) {
+        setCurrentDay(newDay);
+        setSelectedDate(new Date()); // Reset selected date to today
+        setIsHistoricalView(false);
+        fetchData(); // Corrected: No argument needed
+        showToast('New day started - refreshing data', 'info');
+      }
+    };
+
+    const intervalId = setInterval(checkDayChange, 60000); // Check every minute
+    return () => clearInterval(intervalId); // Cleanup on unmount
+  }, [currentDay, isHistoricalView, fetchData]);
+
+  useEffect(() => {
+    fetchData();
   }, [fetchData]);
 
   const chartData = useMemo(() => ({
@@ -415,69 +427,72 @@ export const TransactionManager: React.FC = () => {
 
   const handleEdit = (id: number) => {
     setTransactions(prev =>
-      prev.map(transaction =>
-        transaction.id === id
-          ? { ...transaction, isEditing: true }
-          : transaction
-      )
+      prev.map(tx => (tx.id === id ? { ...tx, isEditing: true } : tx))
     );
   };
 
   const handleSave = async (id: number) => {
-    const transaction = transactions.find(t => t.id === id);
-    if (!transaction) return;
+    const transactionToSave = transactions.find(tx => tx.id === id);
+    if (!transactionToSave) return;
+
+    // Remove isEditing property before saving
+    const { isEditing, created_at, ...updateData } = transactionToSave; // Exclude created_at too
 
     try {
+      setLoading(true); 
       const { error } = await supabase
-        .from('orders')
-        .update({
-          technician_name: transaction.technician_name,
-          location: transaction.location,
-          total: transaction.total,
-          tip: transaction.tip,
-          payment_method: transaction.payment_method,
-          tip_method: transaction.tip_method,
-        })
+        .from('orders') 
+        .update(updateData)
         .eq('id', id);
 
-      if (error) throw error;
+      if (error) {
+        throw new Error(`Failed to save transaction: ${error.message}`);
+      }
 
+      // Exit editing mode on successful save
       setTransactions(prev =>
-        prev.map(t =>
-          t.id === id
-            ? { ...t, isEditing: false }
-            : t
-        )
+        prev.map(tx => (tx.id === id ? { ...transactionToSave, isEditing: false } : tx))
       );
+      showToast('Transaction saved successfully!', 'success');
+      // Refetch data to ensure summaries are updated after edit
+      await fetchData(); // Refresh data after save
     } catch (error) {
-      console.error('Error updating transaction:', error);
+      console.error("Error saving transaction:", error);
+      showToast(error instanceof Error ? error.message : 'Failed to save transaction', 'error');
+    } finally {
+      setLoading(false);
     }
   };
 
   const handleDelete = async (id: number) => {
-    if (!window.confirm('Are you sure you want to delete this transaction?')) return;
-
+    // Optional: Add confirmation dialog here
     try {
+      setLoading(true);
       const { error } = await supabase
-        .from('orders')
+        .from('orders') 
         .delete()
         .eq('id', id);
 
-      if (error) throw error;
+      if (error) {
+        throw new Error(`Failed to delete transaction: ${error.message}`);
+      }
 
-      setTransactions(prev => prev.filter(t => t.id !== id));
+      // Remove transaction from state - UI updates immediately
+      setTransactions(prev => prev.filter(tx => tx.id !== id)); 
+      showToast('Transaction deleted successfully!', 'success');
+      // Refetch data to ensure summaries are updated after delete
+      await fetchData(); // Refresh data after delete
     } catch (error) {
-      console.error('Error deleting transaction:', error);
+      console.error("Error deleting transaction:", error);
+      showToast(error instanceof Error ? error.message : 'Failed to delete transaction', 'error');
+    } finally {
+      setLoading(false);
     }
   };
 
   const handleChange = (id: number, field: keyof Transaction, value: any) => {
     setTransactions(prev =>
-      prev.map(transaction =>
-        transaction.id === id
-          ? { ...transaction, [field]: value }
-          : transaction
-      )
+      prev.map(tx => (tx.id === id ? { ...tx, [field]: value } : tx))
     );
   };
 
@@ -524,7 +539,7 @@ export const TransactionManager: React.FC = () => {
       total: transaction.total || 0,
       tip: transaction.tip || 0
     }));
-  }, [transactions, selectedLocation, selectedTechnician, getSortedTransactions]);
+  }, [transactions, selectedLocation, selectedTechnician, getSortedTransactions, sortField, sortDirection]);
 
   const availableTechnicians = useMemo(() => {
     const techs = new Set<string>();
@@ -630,7 +645,7 @@ export const TransactionManager: React.FC = () => {
       } else {
         showToast('An unexpected error occurred while toggling cash out', 'error');
       }
-      fetchData(new Date());
+      fetchData();
     }
   };
 
@@ -710,30 +725,22 @@ export const TransactionManager: React.FC = () => {
       } else {
         showToast('An unexpected error occurred while toggling check request', 'error');
       }
-      fetchData(new Date());
+      fetchData();
     }
   };
 
   const handleDateChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const newDate = new Date(event.target.value + 'T00:00:00');
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    
-    if (newDate > today) {
-      showToast('Cannot select future dates', 'warning');
-      return;
-    }
-
+    const newDate = new Date(event.target.value + 'T00:00:00'); // Ensure time is set to start of day
     setSelectedDate(newDate);
     setIsHistoricalView(formatDate(newDate) !== formatDate(new Date()));
-    fetchData(newDate);
+    // fetchData(); // fetchData runs via useEffect dependency on selectedDate
   };
 
   const handleReturnToToday = () => {
     const today = new Date();
     setSelectedDate(today);
     setIsHistoricalView(false);
-    fetchData(today);
+    // fetchData(); // fetchData runs via useEffect dependency on selectedDate
   };
 
   if (loading) {
@@ -865,7 +872,7 @@ export const TransactionManager: React.FC = () => {
         justifyContent: 'center',
         mb: 4
       }}>
-        {LOCATIONS.map((loc) => (
+        {accessibleLocations.map((loc) => (
           <Button
             key={loc}
             variant={selectedLocation === loc ? "contained" : "outlined"}
@@ -894,7 +901,7 @@ export const TransactionManager: React.FC = () => {
               transition: 'all 0.3s ease'
             }}
           >
-            {loc}
+            {LOCATION_DISPLAY_NAMES[loc] || loc}
           </Button>
         ))}
       </Box>
@@ -976,7 +983,7 @@ export const TransactionManager: React.FC = () => {
                   }}
                   onClick={() => handleSort('payment_method')}
                 >
-                  Payment Method {getSortIcon('payment_method')}
+                  Method {getSortIcon('payment_method')}
                 </TableCell>
                 <TableCell 
                   sx={{ 
@@ -1031,14 +1038,19 @@ export const TransactionManager: React.FC = () => {
                 >
                   <TableCell sx={{ 
                     fontWeight: 500,
-                    color: 'text.secondary'
+                    color: 'text.secondary',
+                    minWidth: '150px'
                   }}>
                     {transaction.isEditing ? (
                       <TextField
-                        type="datetime-local"
-                        value={transaction.date.slice(0, 16)}
-                        onChange={(e) => handleChange(transaction.id, 'date', e.target.value)}
+                        type="time"
+                        value={transaction.date.split('T')[1].substring(0, 5)}
+                        onChange={(e) => {
+                          const currentDate = transaction.date.split('T')[0];
+                          handleChange(transaction.id, 'date', `${currentDate}T${e.target.value}:00-07:00`);
+                        }}
                         size="small"
+                        fullWidth
                         sx={{
                           '& .MuiOutlinedInput-root': {
                             borderRadius: 2,
@@ -1054,13 +1066,15 @@ export const TransactionManager: React.FC = () => {
                   </TableCell>
                   <TableCell sx={{ 
                     fontWeight: 500,
-                    letterSpacing: '0.02em'
+                    letterSpacing: '0.02em',
+                    minWidth: '180px'
                   }}>
                     {transaction.isEditing ? (
-                      <TextField
+                      <Select
                         value={transaction.technician_name}
                         onChange={(e) => handleChange(transaction.id, 'technician_name', e.target.value)}
                         size="small"
+                        fullWidth
                         sx={{
                           '& .MuiOutlinedInput-root': {
                             borderRadius: 2,
@@ -1069,20 +1083,28 @@ export const TransactionManager: React.FC = () => {
                             },
                           }
                         }}
-                      />
+                      >
+                        {technicians
+                          .filter(tech => tech.location === transaction.location)
+                          .map(tech => (
+                            <MenuItem key={tech.id} value={tech.name}>{tech.name}</MenuItem>
+                          ))}
+                      </Select>
                     ) : (
                       transaction.technician_name
                     )}
                   </TableCell>
                   <TableCell sx={{ 
                     fontWeight: 500,
-                    letterSpacing: '0.02em'
+                    letterSpacing: '0.02em',
+                    minWidth: '140px'
                   }}>
                     {transaction.isEditing ? (
-                      <TextField
+                      <Select
                         value={transaction.location}
                         onChange={(e) => handleChange(transaction.id, 'location', e.target.value)}
                         size="small"
+                        fullWidth
                         sx={{
                           '& .MuiOutlinedInput-root': {
                             borderRadius: 2,
@@ -1091,14 +1113,19 @@ export const TransactionManager: React.FC = () => {
                             },
                           }
                         }}
-                      />
+                      >
+                        {LOCATIONS.map(loc => (
+                          <MenuItem key={loc} value={loc}>{LOCATION_DISPLAY_NAMES[loc] || loc}</MenuItem>
+                        ))}
+                      </Select>
                     ) : (
-                      transaction.location
+                      LOCATION_DISPLAY_NAMES[transaction.location] || transaction.location
                     )}
                   </TableCell>
                   <TableCell sx={{ 
                     fontWeight: 500,
-                    color: 'text.secondary'
+                    color: 'text.secondary',
+                    minWidth: '120px'
                   }}>
                     {transaction.isEditing ? (
                       <Select
@@ -1124,9 +1151,10 @@ export const TransactionManager: React.FC = () => {
                       transaction.payment_method.toUpperCase()
                     )}
                   </TableCell>
-                  <TableCell align="right" sx={{ 
+                  <TableCell sx={{ 
                     fontWeight: 500,
-                    color: 'text.secondary'
+                    color: 'text.secondary',
+                    minWidth: '100px'
                   }}>
                     {transaction.isEditing ? (
                       <TextField
@@ -1134,7 +1162,10 @@ export const TransactionManager: React.FC = () => {
                         value={transaction.total}
                         onChange={(e) => handleChange(transaction.id, 'total', parseFloat(e.target.value))}
                         size="small"
-                        inputProps={{ style: { textAlign: 'right' } }}
+                        fullWidth
+                        inputProps={{ 
+                          style: { textAlign: 'right', paddingRight: '8px' }
+                        }}
                         sx={{
                           '& .MuiOutlinedInput-root': {
                             borderRadius: 2,
@@ -1145,12 +1176,13 @@ export const TransactionManager: React.FC = () => {
                         }}
                       />
                     ) : (
-                      `$${transaction.total.toFixed(2)}`
+                      <Box sx={{ textAlign: 'right' }}>${transaction.total.toFixed(2)}</Box>
                     )}
                   </TableCell>
-                  <TableCell align="right" sx={{ 
+                  <TableCell sx={{ 
                     fontWeight: 500,
-                    color: 'text.secondary'
+                    color: 'text.secondary',
+                    minWidth: '200px'
                   }}>
                     {transaction.isEditing ? (
                       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, justifyContent: 'flex-end' }}>
@@ -1159,7 +1191,9 @@ export const TransactionManager: React.FC = () => {
                           value={transaction.tip}
                           onChange={(e) => handleChange(transaction.id, 'tip', parseFloat(e.target.value))}
                           size="small"
-                          inputProps={{ style: { textAlign: 'right' } }}
+                          inputProps={{ 
+                            style: { textAlign: 'right', paddingRight: '8px' }
+                          }}
                           sx={{
                             width: '100px',
                             '& .MuiOutlinedInput-root': {
@@ -1175,7 +1209,7 @@ export const TransactionManager: React.FC = () => {
                           onChange={(e) => handleChange(transaction.id, 'tip_method', e.target.value)}
                           size="small"
                           sx={{
-                            width: '90px',
+                            width: '80px',
                             '& .MuiOutlinedInput-root': {
                               borderRadius: 2,
                               '&:hover fieldset': {
@@ -1184,8 +1218,8 @@ export const TransactionManager: React.FC = () => {
                             }
                           }}
                         >
-                          <MenuItem value="card">💳 Card</MenuItem>
-                          <MenuItem value="cash">💵 Cash</MenuItem>
+                          <MenuItem value="card">💳</MenuItem>
+                          <MenuItem value="cash">💵</MenuItem>
                         </Select>
                       </Box>
                     ) : (

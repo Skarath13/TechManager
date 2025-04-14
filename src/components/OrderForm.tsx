@@ -8,35 +8,50 @@ import {
   Collapse,
 } from '@mui/material';
 import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../contexts/AuthContext';
+import { Location } from '../contexts/AuthContext';
 
-interface Location {
+interface LocationTeams {
   name: string;
   technicians: string[];
 }
 
-const LOCATIONS: Location[] = [
+const LOCATIONS: LocationTeams[] = [
   {
-    name: "Irvine Team",
+    name: "irvine",
     technicians: ["Katie", "Angela", "Celine", "Elena", "Gabby", "Tammy", "Fiona"]
   },
   {
-    name: "Tustin Team",
+    name: "tustin",
     technicians: ["Alice", "Amy", "Austin", "Emma", "Hannah", "Maria", "Olivia", "Wendy"]
   },
   {
-    name: "Santa Ana Team",
+    name: "santa_ana",
     technicians: ["Giana", "Macy", "Nancy", "Rosy"]
   },
   {
-    name: "Costa Mesa Team",
+    name: "costa_mesa",
     technicians: ["Chloe", "Lucy", "Melissa", "Natalie", "Trish", "Vivian"]
   }
 ];
 
+const LOCATION_DISPLAY_NAMES: Record<string, string> = {
+  'irvine': 'Irvine Team',
+  'tustin': 'Tustin Team',
+  'santa_ana': 'Santa Ana Team',
+  'costa_mesa': 'Costa Mesa Team'
+};
+
 const OrderForm: React.FC = () => {
   const navigate = useNavigate();
+  const { hasLocationAccess } = useAuth();
   const [selectedLocation, setSelectedLocation] = useState<string | null>(null);
   const [selectedTechnician, setSelectedTechnician] = useState<string | null>(null);
+
+  // Filter locations based on user access
+  const accessibleLocations = LOCATIONS.filter(location => 
+    hasLocationAccess(location.name as Location)
+  );
 
   const handleLocationSelect = (locationName: string) => {
     setSelectedLocation(locationName);
@@ -63,7 +78,7 @@ const OrderForm: React.FC = () => {
         Select Location
       </Typography>
       <Grid container spacing={2} sx={{ mb: 4 }}>
-        {LOCATIONS.map((location) => (
+        {accessibleLocations.map((location) => (
           <Grid item xs={12} sm={6} key={location.name}>
             <Paper
               elevation={selectedLocation === location.name ? 6 : 1}
@@ -81,7 +96,7 @@ const OrderForm: React.FC = () => {
               }}
               onClick={() => handleLocationSelect(location.name)}
             >
-              <Typography variant="h6">{location.name}</Typography>
+              <Typography variant="h6">{LOCATION_DISPLAY_NAMES[location.name]}</Typography>
             </Paper>
           </Grid>
         ))}

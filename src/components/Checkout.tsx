@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Box,
   Typography,
@@ -9,8 +9,17 @@ import {
   ToggleButtonGroup,
 } from '@mui/material';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { supabase } from '../services/supabase';
+import { supabase } from '../lib/supabaseClient';
 import NotificationModal from './NotificationModal';
+import { useAuth } from '../contexts/AuthContext';
+
+// Add LOCATION_DISPLAY_NAMES map here too, or import from a shared file
+const LOCATION_DISPLAY_NAMES: Record<string, string> = {
+  'irvine': 'Irvine',
+  'tustin': 'Tustin',
+  'santa_ana': 'Santa Ana',
+  'costa_mesa': 'Costa Mesa'
+};
 
 interface LocationState {
   location: string;
@@ -20,13 +29,15 @@ interface LocationState {
 const Checkout: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
-  const { location: selectedLocation, technician: selectedTechnician } = location.state as LocationState;
+  const { isAuthenticated, user, session } = useAuth();
+  const locationState = location.state as LocationState;
 
+  const [amount, setAmount] = useState('');
+  const [tipAmount, setTipAmount] = useState('');
   const [paymentMethod, setPaymentMethod] = useState<'card' | 'cash' | 'venmo' | 'zelle' | null>(null);
-  const [amount, setAmount] = useState<string>('');
-  const [showTipOptions, setShowTipOptions] = useState(false);
   const [tipMethod, setTipMethod] = useState<'card' | 'cash' | null>(null);
-  const [tipAmount, setTipAmount] = useState<string>('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [showTipOptions, setShowTipOptions] = useState(false);
   
   // Notification state
   const [notification, setNotification] = useState<{
@@ -38,51 +49,90 @@ const Checkout: React.FC = () => {
     type: 'success',
     message: '',
   });
-
-  const handleSubmit = async () => {
-    if (!amount || !paymentMethod) {
-      setNotification({
-        open: true,
-        type: 'error',
-        message: 'Please enter the total amount and payment method.'
+  
+  // Check authentication and required state
+  useEffect(() => {
+    if (!isAuthenticated) {
+      navigate('/login', { 
+        replace: true,
+        state: { from: location }
       });
       return;
     }
 
-    try {
-      const { error } = await supabase
-        .from('orders')
-        .insert([
-          {
-            technician_name: selectedTechnician,
-            location: selectedLocation,
-            total: parseFloat(amount),
-            tip: tipAmount ? parseFloat(tipAmount) : 0,
-            payment_method: paymentMethod,
-            tip_method: tipMethod,
-            date: new Date().toISOString()
-          }
-        ]);
+    if (!locationState) {
+      navigate('/', { replace: true });
+      return;
+    }
+  }, [isAuthenticated, locationState, navigate, location]);
 
-      if (error) throw error;
-      
-      setNotification({
-        open: true,
-        type: 'success',
-        message: 'Order submitted successfully! ✨'
-      });
+  // If no state or not authenticated, don't render the form
+  if (!locationState || !isAuthenticated) {
+    return null;
+  }
 
-      setTimeout(() => {
-        navigate('/');
-      }, 2000);
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSubmitting(true);
 
-    } catch (error) {
-      console.error('Error submitting order:', error);
+    if (!amount || !paymentMethod) {
       setNotification({
         open: true,
         type: 'error',
-        message: 'Error submitting order. Please try again.'
+        message: 'Please fill in all required fields'
       });
+      setIsSubmitting(false);
+      return;
+    }
+
+    if (!isAuthenticated) {
+      navigate('/login', { 
+        replace: true,
+        state: { from: location }
+      });
+      setIsSubmitting(false); 
+      return;
+    }
+
+    try {
+      const orderData = {
+        technician_name: locationState.technician,
+        location: locationState.location,
+        total: parseFloat(amount),
+        tip: tipAmount ? parseFloat(tipAmount) : null,
+        payment_method: paymentMethod,
+        tip_method: tipMethod || null,
+      };
+
+      const { error } = await supabase
+        .from('orders')
+        .insert([orderData]);
+
+      if (error) {
+        console.error('Supabase insert error:', error);
+        throw new Error(error.message || 'Failed to submit order via Supabase client');
+      }
+
+      setNotification({
+        open: true,
+        type: 'success',
+        message: 'Order submitted successfully!'
+      });
+      setAmount('');
+      setTipAmount('');
+      setPaymentMethod(null);
+      setTipMethod(null);
+      setShowTipOptions(false);
+
+    } catch (error) {
+      console.error('Error submitting order:', error);
+      setNotification({ 
+        open: true,
+        type: 'error',
+        message: error instanceof Error ? error.message : 'Failed to submit order'
+      });
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -124,8 +174,12 @@ const Checkout: React.FC = () => {
           <Typography variant="h6" gutterBottom sx={{ color: 'text.primary', fontWeight: 600 }}>
             Order Details
           </Typography>
-          <Typography color="text.secondary">Location: {selectedLocation}</Typography>
-          <Typography color="text.secondary">Technician: {selectedTechnician}</Typography>
+          <Typography color="text.secondary">
+            Location: {LOCATION_DISPLAY_NAMES[locationState?.location] || locationState?.location}
+          </Typography>
+          <Typography color="text.secondary">
+             Technician: {locationState?.technician}
+           </Typography>
         </Paper>
 
         <Paper elevation={3} sx={{ p: 3, mb: 3, borderRadius: 2, bgcolor: 'background.paper' }}>
@@ -166,6 +220,7 @@ const Checkout: React.FC = () => {
               fullWidth
               label="Total Amount"
               type="number"
+              required
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
               InputProps={{
@@ -232,6 +287,7 @@ const Checkout: React.FC = () => {
                   fullWidth
                   label="Tip Amount"
                   type="number"
+                  required
                   value={tipAmount}
                   onChange={(e) => setTipAmount(e.target.value)}
                   InputProps={{
@@ -248,7 +304,7 @@ const Checkout: React.FC = () => {
             variant="contained"
             size="large"
             onClick={handleSubmit}
-            disabled={!amount || !paymentMethod}
+            disabled={!amount || !paymentMethod || isSubmitting}
             sx={{
               background: 'linear-gradient(45deg, #FFB7C5 30%, #FFC8D3 90%)',
               boxShadow: '0 3px 5px 2px rgba(255, 183, 197, .3)',
@@ -262,7 +318,7 @@ const Checkout: React.FC = () => {
               }
             }}
           >
-            Submit Order 💖
+            {isSubmitting ? 'Submitting...' : 'Submit Order 💖'}
           </Button>
         </Box>
 
