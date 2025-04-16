@@ -43,6 +43,7 @@ import {
 } from 'chart.js';
 import { Bar } from 'react-chartjs-2';
 import { useAuth, Location } from '../contexts/AuthContext';
+import { ServiceType, StyleType, STYLE_OPTIONS, DaysSinceType, DAYS_SINCE_OPTIONS } from './Checkout';
 
 ChartJS.register(
   CategoryScale,
@@ -60,14 +61,16 @@ interface Transaction {
   date: string;
   payment_method: 'cash' | 'card' | 'venmo' | 'zelle';
   total: number;
-  tip: number;
+  tip: number | null;
   location: string;
-  tip_method: string | null;
-  created_at: string;
+  tip_method: 'cash' | 'card' | null;
+  service: string;
+  style: string;
+  days_since_last_appointment: string | null;
   isEditing?: boolean;
 }
 
-type SortField = 'date' | 'technician_name' | 'total' | 'tip' | 'payment_method' | 'location';
+type SortField = 'date' | 'technician_name' | 'location' | 'service' | 'style' | 'days_since_last_appointment' | 'payment_method' | 'total' | 'tip';
 type SortDirection = 'asc' | 'desc';
 
 interface Technician {
@@ -193,7 +196,7 @@ const createSubmissionData = (tech: TechnicianSummary, isCashOut: boolean, isChe
   card_processing_fees: tech.cardProcessingFees || 0,
   card_tips_processing_fee: tech.cardTipsProcessingFee || 0,
   manager_owed: newManagerOwed !== undefined ? newManagerOwed : tech.managerOwed || 0,
-  carry_over: tech.payLater && newManagerOwed !== undefined ? newManagerOwed : 0,
+  carry_over: Math.max(0, newManagerOwed !== undefined ? newManagerOwed : tech.managerOwed || 0),
   is_cashed_out: isCashOut,
   is_check_requested: isCheckRequest
 });
@@ -300,14 +303,33 @@ export const TransactionManager: React.FC = () => {
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
-      const targetDate = formatDate(selectedDate);
-      const previousDate = formatDate(new Date(selectedDate.getTime() - 24 * 60 * 60 * 1000));
+      const targetDateString = formatDate(selectedDate); // YYYY-MM-DD for submissions
+      const previousDateString = formatDate(new Date(selectedDate.getTime() - 24 * 60 * 60 * 1000));
 
-      // Use supabase client for fetching data
+      // Construct UTC start and end timestamps corresponding to the *local* selected day
+      const localYear = selectedDate.getFullYear();
+      const localMonth = selectedDate.getMonth(); // 0-indexed
+      const localDay = selectedDate.getDate();
+
+      // Start of the selected day in the local timezone, converted to UTC
+      const startOfDayLocal = new Date(localYear, localMonth, localDay, 0, 0, 0, 0);
+      const startQueryTimestamp = startOfDayLocal.toISOString();
+
+      // Start of the *next* day in the local timezone, converted to UTC
+      const startOfNextDayLocal = new Date(localYear, localMonth, localDay + 1, 0, 0, 0, 0);
+      const endQueryTimestamp = startOfNextDayLocal.toISOString();
+
       const techniciansPromise = supabase.from('technicians').select('*');
-      const ordersPromise = supabase.from('orders').select('*').order('date', { ascending: false });
-      const todaySubmissionsPromise = supabase.from('submissions').select('*').eq('date', targetDate);
-      const yesterdaySubmissionsPromise = supabase.from('submissions').select('*').eq('date', previousDate);
+      const ordersPromise = supabase
+          .from('orders')
+          .select('*, service, style, days_since_last_appointment')
+          .gte('date', startQueryTimestamp)
+          .lt('date', endQueryTimestamp)
+          .order('date', { ascending: false });
+          
+      // Assume 'submissions' table uses a DATE column, so filter by YYYY-MM-DD string
+      const todaySubmissionsPromise = supabase.from('submissions').select('*').eq('date', targetDateString);
+      const yesterdaySubmissionsPromise = supabase.from('submissions').select('*').eq('date', previousDateString);
 
       const [
         { data: techniciansData, error: techniciansError },
@@ -328,7 +350,14 @@ export const TransactionManager: React.FC = () => {
       if (yesterdaySubmissionsError) throw new Error(`Failed to fetch yesterday's submissions: ${yesterdaySubmissionsError.message}`);
 
       setTechnicians(techniciansData || []);
-      setTransactions((transactionsData || []).map(tx => ({ ...tx, isEditing: false })));
+      const editableTransactions = (transactionsData || []).map(tx => ({
+        ...tx,
+        isEditing: false,
+        service: tx.service || 'Unknown',
+        style: tx.style || 'Unknown',
+        days_since_last_appointment: tx.days_since_last_appointment,
+      })) as EditableTransaction[];
+      setTransactions(editableTransactions);
       
       // Recalculate summaries whenever data is fetched
       const summaries = await calculateTechnicianSummaries(
@@ -435,11 +464,16 @@ export const TransactionManager: React.FC = () => {
     const transactionToSave = transactions.find(tx => tx.id === id);
     if (!transactionToSave) return;
 
-    // Remove isEditing property before saving
-    const { isEditing, created_at, ...updateData } = transactionToSave; // Exclude created_at too
+    // Remove isEditing property
+    const { isEditing, ...updateData } = transactionToSave;
+
+    // Ensure days_since_last_appointment is null if service is not Refill
+    if (updateData.service !== 'Refill') {
+      updateData.days_since_last_appointment = null;
+    }
 
     try {
-      setLoading(true); 
+      setLoading(true);
       const { error } = await supabase
         .from('orders') 
         .update(updateData)
@@ -492,7 +526,24 @@ export const TransactionManager: React.FC = () => {
 
   const handleChange = (id: number, field: keyof Transaction, value: any) => {
     setTransactions(prev =>
-      prev.map(tx => (tx.id === id ? { ...tx, [field]: value } : tx))
+      prev.map(tx => {
+        if (tx.id === id) {
+          const updatedTx = { ...tx, [field]: value };
+          // If service changes away from Refill, clear days_since
+          if (field === 'service' && value !== 'Refill') {
+            updatedTx.days_since_last_appointment = null;
+          }
+          // If service changes, reset style if it's not valid for the new service
+          if (field === 'service') {
+            const validStyles = STYLE_OPTIONS[value as ServiceType] || [];
+            if (!validStyles.includes(updatedTx.style as StyleType)) {
+              updatedTx.style = validStyles[0] || ''; // Set to first valid style or empty
+            }
+          }
+          return updatedTx;
+        }
+        return tx;
+      })
     );
   };
 
@@ -504,19 +555,27 @@ export const TransactionManager: React.FC = () => {
   const getSortedTransactions = (transactions: EditableTransaction[]) => {
     return [...transactions].sort((a, b) => {
       const direction = sortDirection === 'asc' ? 1 : -1;
-      
+      const fieldA = a[sortField];
+      const fieldB = b[sortField];
+
       switch (sortField) {
-        case 'date':
+        case 'date': 
           return direction * (new Date(a.date).getTime() - new Date(b.date).getTime());
         case 'total':
-          return direction * ((a.total || 0) - (b.total || 0));
         case 'tip':
-          return direction * ((a.tip || 0) - (b.tip || 0));
+          return direction * ((Number(fieldA) || 0) - (Number(fieldB) || 0));
         case 'technician_name':
-        case 'payment_method':
         case 'location':
-          return direction * (a[sortField].localeCompare(b[sortField]));
+        case 'payment_method':
+        case 'service':
+        case 'style':
+        case 'days_since_last_appointment': // Handle potential nulls
+          const valA = fieldA === null ? '' : String(fieldA);
+          const valB = fieldB === null ? '' : String(fieldB);
+          return direction * valA.localeCompare(valB);
         default:
+          // Ensure exhaustive check if using TypeScript 4.0+
+          // const _exhaustiveCheck: never = sortField;
           return 0;
       }
     });
@@ -583,10 +642,11 @@ export const TransactionManager: React.FC = () => {
 
       if (fetchError) throw fetchError;
 
-      // Calculate the new manager owed amount
+      // Calculate the new manager owed amount based on whether cash out is being enabled or disabled
+      const currentManagerOwed = tech.cashTotal * (1 - tech.commission);
       const newManagerOwed = tech.isCashedOut 
-        ? tech.cashTotal * (1 - tech.commission)  // Recalculate if canceling
-        : tech.managerOwed - tech.cashOutAmount;  // Reduce by cash out amount if enabling
+        ? currentManagerOwed + tech.carryOver // Cancelling cash out: restore original owed + previous carry over
+        : (tech.managerOwed + tech.carryOver) - tech.cashOutAmount; // Enabling cash out: current owed + previous carry over - cash out amount
 
       if (existingSubmission) {
         if (tech.isCashedOut) {
@@ -645,7 +705,7 @@ export const TransactionManager: React.FC = () => {
       } else {
         showToast('An unexpected error occurred while toggling cash out', 'error');
       }
-      fetchData();
+      fetchData(); // Refetch data on error to revert optimistic UI changes
     }
   };
 
@@ -940,7 +1000,7 @@ export const TransactionManager: React.FC = () => {
           overflow: 'hidden',
           boxShadow: '0 4px 20px rgba(255, 183, 197, 0.2)'
         }}>
-          <Table>
+          <Table size="small">
             <TableHead>
               <TableRow sx={{ 
                 background: 'linear-gradient(45deg, #FFB7C5 30%, #FFC8D3 90%)',
@@ -950,6 +1010,10 @@ export const TransactionManager: React.FC = () => {
                     color: '#000000', 
                     fontWeight: 600,
                     cursor: 'pointer',
+                    py: 1,
+                    px: 1.5,
+                    fontSize: '0.85rem',
+                    whiteSpace: 'nowrap',
                     '&:hover': {
                       opacity: 0.8,
                     }
@@ -963,6 +1027,10 @@ export const TransactionManager: React.FC = () => {
                     color: '#000000', 
                     fontWeight: 600,
                     cursor: 'pointer',
+                    py: 1,
+                    px: 1.5,
+                    fontSize: '0.85rem',
+                    whiteSpace: 'nowrap',
                     '&:hover': {
                       opacity: 0.8,
                     }
@@ -971,12 +1039,83 @@ export const TransactionManager: React.FC = () => {
                 >
                   Technician {getSortIcon('technician_name')}
                 </TableCell>
-                <TableCell sx={{ color: '#000000', fontWeight: 600 }}>Location</TableCell>
                 <TableCell 
                   sx={{ 
                     color: '#000000', 
                     fontWeight: 600,
                     cursor: 'pointer',
+                    py: 1,
+                    px: 1.5,
+                    fontSize: '0.85rem',
+                    whiteSpace: 'nowrap',
+                    '&:hover': {
+                      opacity: 0.8,
+                    }
+                  }}
+                  onClick={() => handleSort('location')}
+                >
+                  Location {getSortIcon('location')}
+                </TableCell>
+                <TableCell 
+                  sx={{ 
+                    color: '#000000', 
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                    py: 1,
+                    px: 1.5,
+                    fontSize: '0.85rem',
+                    whiteSpace: 'nowrap',
+                    '&:hover': {
+                      opacity: 0.8,
+                    }
+                  }}
+                  onClick={() => handleSort('service')}
+                >
+                  Service {getSortIcon('service')}
+                </TableCell>
+                <TableCell 
+                  sx={{ 
+                    color: '#000000', 
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                    py: 1,
+                    px: 1.5,
+                    fontSize: '0.85rem',
+                    whiteSpace: 'nowrap',
+                    '&:hover': {
+                      opacity: 0.8,
+                    }
+                  }}
+                  onClick={() => handleSort('style')}
+                >
+                  Style {getSortIcon('style')}
+                </TableCell>
+                <TableCell 
+                  sx={{ 
+                    color: '#000000', 
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                    py: 1,
+                    px: 1.5,
+                    fontSize: '0.85rem',
+                    whiteSpace: 'nowrap',
+                    '&:hover': {
+                      opacity: 0.8,
+                    }
+                  }}
+                  onClick={() => handleSort('days_since_last_appointment')}
+                >
+                  Days Since {getSortIcon('days_since_last_appointment')}
+                </TableCell>
+                <TableCell 
+                  sx={{ 
+                    color: '#000000', 
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                    py: 1,
+                    px: 1.5,
+                    fontSize: '0.85rem',
+                    whiteSpace: 'nowrap',
                     '&:hover': {
                       opacity: 0.8,
                     }
@@ -990,6 +1129,10 @@ export const TransactionManager: React.FC = () => {
                     color: '#000000', 
                     fontWeight: 600,
                     cursor: 'pointer',
+                    py: 1,
+                    px: 1.5,
+                    fontSize: '0.85rem',
+                    whiteSpace: 'nowrap',
                     '&:hover': {
                       opacity: 0.8,
                     }
@@ -1004,6 +1147,10 @@ export const TransactionManager: React.FC = () => {
                     color: '#000000', 
                     fontWeight: 600,
                     cursor: 'pointer',
+                    py: 1,
+                    px: 1.5,
+                    fontSize: '0.85rem',
+                    whiteSpace: 'nowrap',
                     '&:hover': {
                       opacity: 0.8,
                     }
@@ -1012,7 +1159,7 @@ export const TransactionManager: React.FC = () => {
                 >
                   Tip {getSortIcon('tip')}
                 </TableCell>
-                <TableCell align="center" sx={{ color: '#000000', fontWeight: 600 }}>Actions</TableCell>
+                <TableCell align="center" sx={{ color: '#000000', fontWeight: 600, py: 1, px: 1.5, fontSize: '0.85rem', whiteSpace: 'nowrap' }}>Actions</TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
@@ -1020,16 +1167,19 @@ export const TransactionManager: React.FC = () => {
                 <TableRow 
                   key={transaction.id}
                   sx={{
-                    bgcolor: index % 2 === 0 ? 'rgba(255, 183, 197, 0.05)' : 'transparent',
+                    bgcolor: index % 2 === 0 ? 'rgba(255, 183, 197, 0.03)' : 'transparent',
                     '&:hover': {
-                      bgcolor: 'rgba(255, 183, 197, 0.1)',
+                      bgcolor: 'rgba(255, 183, 197, 0.08)',
                     },
-                    transition: 'all 0.3s ease',
+                    transition: 'background-color 0.2s ease',
                     '& > td': {
-                      fontFamily: '"Helvetica Neue", Arial, sans-serif',
-                      fontSize: '0.95rem',
+                      py: 0.5,
+                      px: 1.5,
+                      fontSize: '0.9rem',
                       color: '#2c3e50',
-                      transition: 'all 0.3s ease',
+                      borderBottom: '1px solid rgba(224, 224, 224, 0.6)',
+                      transition: 'color 0.2s ease',
+                      whiteSpace: 'nowrap',
                     },
                     '&:hover > td': {
                       color: '#000000',
@@ -1066,7 +1216,7 @@ export const TransactionManager: React.FC = () => {
                   </TableCell>
                   <TableCell sx={{ 
                     fontWeight: 500,
-                    letterSpacing: '0.02em',
+                    letterSpacing: '0.01em',
                     minWidth: '180px'
                   }}>
                     {transaction.isEditing ? (
@@ -1096,7 +1246,7 @@ export const TransactionManager: React.FC = () => {
                   </TableCell>
                   <TableCell sx={{ 
                     fontWeight: 500,
-                    letterSpacing: '0.02em',
+                    letterSpacing: '0.01em',
                     minWidth: '140px'
                   }}>
                     {transaction.isEditing ? (
@@ -1128,33 +1278,90 @@ export const TransactionManager: React.FC = () => {
                     minWidth: '120px'
                   }}>
                     {transaction.isEditing ? (
-                      <Select
-                        value={transaction.payment_method}
-                        onChange={(e) => handleChange(transaction.id, 'payment_method', e.target.value)}
-                        size="small"
-                        fullWidth
-                        sx={{
-                          '& .MuiOutlinedInput-root': {
-                            borderRadius: 2,
-                            '&:hover fieldset': {
-                              borderColor: 'primary.light',
-                            },
-                          }
-                        }}
-                      >
-                        <MenuItem value="cash">CASH</MenuItem>
-                        <MenuItem value="card">CARD</MenuItem>
-                        <MenuItem value="venmo">VENMO</MenuItem>
-                        <MenuItem value="zelle">ZELLE</MenuItem>
-                      </Select>
+                      <FormControl fullWidth size="small">
+                        <Select
+                          value={transaction.service || ''}
+                          onChange={(e) => handleChange(transaction.id, 'service', e.target.value)}
+                        >
+                          {Object.keys(STYLE_OPTIONS).map(service => (
+                            <MenuItem key={service} value={service}>{service}</MenuItem>
+                          ))}
+                        </Select>
+                      </FormControl>
                     ) : (
-                      transaction.payment_method.toUpperCase()
+                      transaction.service
                     )}
                   </TableCell>
                   <TableCell sx={{ 
                     fontWeight: 500,
                     color: 'text.secondary',
                     minWidth: '100px'
+                  }}>
+                    {transaction.isEditing ? (
+                      <FormControl fullWidth size="small">
+                        <Select
+                          value={transaction.style || ''}
+                          onChange={(e) => handleChange(transaction.id, 'style', e.target.value)}
+                          disabled={!transaction.service}
+                        >
+                          {(transaction.service ? STYLE_OPTIONS[transaction.service as ServiceType] || [] : []).map((style: StyleType) => (
+                            <MenuItem key={style} value={style}>{style}</MenuItem>
+                          ))}
+                        </Select>
+                      </FormControl>
+                    ) : (
+                      transaction.style
+                    )}
+                  </TableCell>
+                  <TableCell sx={{ 
+                    fontWeight: 500,
+                    color: 'text.secondary',
+                    minWidth: '150px'
+                  }}>
+                    {transaction.isEditing && transaction.service === 'Refill' ? (
+                      <FormControl fullWidth size="small">
+                        <Select
+                          value={transaction.days_since_last_appointment || ''}
+                          onChange={(e) => handleChange(transaction.id, 'days_since_last_appointment', e.target.value)}
+                          displayEmpty
+                        >
+                          <MenuItem value="" disabled>Select Days</MenuItem>
+                          {DAYS_SINCE_OPTIONS.map((option: DaysSinceType) => (
+                            <MenuItem key={option} value={option}>{option}</MenuItem>
+                          ))}
+                        </Select>
+                      </FormControl>
+                    ) : (
+                      transaction.service === 'Refill' ? (transaction.days_since_last_appointment || 'N/A') : 'N/A'
+                    )}
+                  </TableCell>
+                  <TableCell sx={{ 
+                    fontWeight: 500,
+                    color: 'text.secondary',
+                    minWidth: '100px'
+                  }}>
+                    {transaction.isEditing ? (
+                      <FormControl fullWidth size="small">
+                        <Select
+                          value={transaction.payment_method || ''}
+                          onChange={(e) => handleChange(transaction.id, 'payment_method', e.target.value)}
+                          displayEmpty
+                        >
+                          <MenuItem value="cash">CASH</MenuItem>
+                          <MenuItem value="card">CARD</MenuItem>
+                          <MenuItem value="venmo">VENMO</MenuItem>
+                          <MenuItem value="zelle">ZELLE</MenuItem>
+                        </Select>
+                      </FormControl>
+                    ) : (
+                      transaction.payment_method?.toUpperCase()
+                    )}
+                  </TableCell>
+                  <TableCell sx={{ 
+                    fontWeight: 500,
+                    color: 'text.secondary',
+                    minWidth: '90px',
+                    textAlign: 'right'
                   }}>
                     {transaction.isEditing ? (
                       <TextField
@@ -1182,13 +1389,14 @@ export const TransactionManager: React.FC = () => {
                   <TableCell sx={{ 
                     fontWeight: 500,
                     color: 'text.secondary',
-                    minWidth: '200px'
+                    minWidth: '120px',
+                    textAlign: 'right'
                   }}>
                     {transaction.isEditing ? (
                       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, justifyContent: 'flex-end' }}>
                         <TextField
                           type="number"
-                          value={transaction.tip}
+                          value={transaction.tip || ''}
                           onChange={(e) => handleChange(transaction.id, 'tip', parseFloat(e.target.value))}
                           size="small"
                           inputProps={{ 
@@ -1207,31 +1415,21 @@ export const TransactionManager: React.FC = () => {
                         <Select
                           value={transaction.tip_method || ''}
                           onChange={(e) => handleChange(transaction.id, 'tip_method', e.target.value)}
-                          size="small"
-                          sx={{
-                            width: '80px',
-                            '& .MuiOutlinedInput-root': {
-                              borderRadius: 2,
-                              '&:hover fieldset': {
-                                borderColor: 'primary.light',
-                              },
-                            }
-                          }}
+                          displayEmpty
                         >
-                          <MenuItem value="card">💳</MenuItem>
                           <MenuItem value="cash">💵</MenuItem>
+                          <MenuItem value="card">💳</MenuItem>
                         </Select>
                       </Box>
                     ) : (
                       <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 1 }}>
-                        <span>${transaction.tip.toFixed(2)}</span>
+                        <span>${transaction.tip?.toFixed(2)}</span>
                         <span>{transaction.tip_method === 'card' ? '💳' : '💵'}</span>
                       </Box>
                     )}
                   </TableCell>
                   <TableCell align="center" sx={{ 
-                    fontWeight: 500,
-                    color: 'text.secondary'
+                    minWidth: '100px'
                   }}>
                     {transaction.isEditing ? (
                       <IconButton 

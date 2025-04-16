@@ -18,7 +18,10 @@ export interface Database {
           tip: number | null
           payment_method: 'cash' | 'card' | 'venmo' | 'zelle'
           tip_method: 'cash' | 'card' | null
-          created_at: string
+          date: string
+          service: string
+          style: string
+          days_since_last_appointment: string | null
         }
         Insert: {
           id?: number
@@ -28,7 +31,10 @@ export interface Database {
           tip?: number | null
           payment_method: 'cash' | 'card' | 'venmo' | 'zelle'
           tip_method?: 'cash' | 'card' | null
-          created_at?: string
+          date?: string
+          service: string
+          style: string
+          days_since_last_appointment?: string | null
         }
         Update: {
           id?: number
@@ -38,7 +44,10 @@ export interface Database {
           tip?: number | null
           payment_method?: 'cash' | 'card' | 'venmo' | 'zelle'
           tip_method?: 'cash' | 'card' | null
-          created_at?: string
+          date?: string
+          service?: string
+          style?: string
+          days_since_last_appointment?: string | null
         }
       }
       technicians: {
